@@ -81,6 +81,20 @@ Enter your apiRegion, apiKey, apiSecret and Search deviceID (This id is used to 
 A deviceID can be found on your IOT account of Tuya got to Cloud => your project => Devices => Pick one of you device ID.
 The initial setup of your devices should be done with the app and this plugin will detect/use the same settings and automatically find/add the devices into Domoticz.
 
+## Local connection (optional)
+
+With **Local connection (LAN)** set to one of the "On" values, the plugin keeps a local connection to every device that announces itself on the LAN (Tuya UDP broadcast) and has a local key. Changes the device pushes arrive in Domoticz within seconds, and its full status is read again at the chosen interval. Domoticz must be in the same network segment as the devices for the broadcasts to arrive; the plugin scans for them at startup and every hour.
+
+While a device's connection delivers every value its Domoticz units use, the device is left out of the API polling, which saves 2 API calls per device and poll. Devices that do not answer on the LAN (e.g. battery sensors that sleep) and values a device sends only to the cloud still come from the cloud as before. With the setting Off nothing changes.
+
+The log shows which devices are connected and which are left out of the polling:
+```
+Local connection: Weather station 192.168.1.50 (3.4), Plug 192.168.1.51 (3.4)
+Local connection to Weather station established
+Local connection: Weather station sends every value its units use locally, left out of the cloud poll
+Local connection: Plug still read from the cloud for add_ele
+```
+
 ## Usage
 
 In the web UI, navigate to the Hardware page. In the hardware dropdown there will be an entry called "TinyTUYA" configure and add the hardware there.
