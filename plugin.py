@@ -24,6 +24,7 @@
         <li>A deviceID can be found in your Tuya IOT account. Go to Cloud => your project => Devices => Select one of your device IDs. (This ID is used to detect all the other devices.)</li>
         <li>Complete the initial setup of your devices using the app, and this plugin will automatically detect and use the same settings to find and add the devices into Domoticz.<br/></li>
         <li>Set the API polling interval in order not to exhaust your calls allocation before the end of the billing period.</li>
+        <li>Local connection: devices that announce themselves on the LAN (UDP broadcast) stay connected with their local key, so their updates arrive within seconds; the interval sets how often the full status is read again. Domoticz must be in the same network segment as the devices. Values a device does not send locally keep their last cloud value.</li>
         </ul>
         If your subscription to the cloud development plan has expired, you can extend it &nbsp; <a href="https://iot.tuya.com/cloud/products/apply-extension">HERE</a><br/>
     </description>
@@ -47,6 +48,15 @@
                 <option label="30 minutes" value="1800" />
             </options>
         </param>
+        <param field="Mode4" label="Local connection (LAN)" width="200px" default="0">
+            <options>
+                <option label="Off" value="0" default="true" />
+                <option label="On, full refresh 1 minute" value="60" />
+                <option label="On, full refresh 2 minutes" value="120" />
+                <option label="On, full refresh 5 minutes" value="300" />
+                <option label="On, full refresh 10 minutes" value="600" />
+            </options>
+        </param>
         <param field="Mode6" label="Debug" width="150px">
             <options>
                 <option label="None" value="0"  default="true" />
@@ -68,6 +78,7 @@ import ast
 import json
 import colorsys
 import time
+import threading
 import re
 import base64
 import requests
@@ -76,6 +87,28 @@ try:
 except ImportError:
     import fakeDomoticz as Domoticz
 import tinytuya
+
+# Local connection (Mode4 = full status refresh in seconds, 0 = off). LOCAL_RESCAN: seconds between LAN
+# scans for the UDP broadcasts that give a device's IP and protocol version; LOCAL_RETRY: pause before
+# reconnecting; LOCAL_TIMEOUT: socket timeout. LOCAL_BEAT: heartbeat keeping the connection open - devices
+# drop it ~30 s after the last packet from the client (their own pushes do not count) and a beat can come up
+# to LOCAL_TIMEOUT late, so 20 s leaves a margin.
+LOCAL_RESCAN = 3600
+LOCAL_RETRY = 60
+LOCAL_BEAT = 20
+LOCAL_TIMEOUT = 5
+local_thread = None
+local_scan = {}
+local_scan_time = 0
+local_scan_error = None
+local_scan_logged = 0
+local_found = None
+local_listeners = {}
+local_applied = {}
+local_state = {}
+localtime = 0
+dps_map = {}
+last_result = {}
 
 class BasePlugin:
     enabled = False
@@ -104,6 +137,12 @@ class BasePlugin:
         onHandleThread(True)
 
     def onStop(self):
+        # Domoticz cannot unload the plugin while the LAN threads still run
+        for listener in local_listeners.values():
+            listener.stopping.set()
+        for thread in list(local_listeners.values()) + [local_thread]:
+            if thread is not None and thread.is_alive():
+                thread.join(30)
         try:
             devs = Devices
             for dev in devs:
@@ -1099,6 +1138,7 @@ class BasePlugin:
         Domoticz.Debug('onHeartbeat called')
         if time.time() - last_update < synctime and testData == False:
             Domoticz.Debug("onHeartbeat called skipped, " +  str(int(time.time() - last_update)) + " < " + str(synctime) + " seconds")
+            onLocalPoll()
             return
         Domoticz.Debug("onHeartbeat called last run: " + str(time.time() - last_update))
         try:
@@ -1147,8 +1187,8 @@ def onHeartbeat():
     global _plugin
     _plugin.onHeartbeat()
 
-def onHandleThread(startup):
-    # Run for every device on startup and heartbeat
+def onHandleThread(startup, local=False):
+    # Run for every device on startup and heartbeat; local=True reads only the devices that answer on the LAN
     try:
         # Run full initialization on first startup or whenever the Tuya client
         # is not present (so we can retry initialization on subsequent
@@ -1166,11 +1206,16 @@ def onHandleThread(startup):
             global product_id
             global t
             global synctime
+            global localtime
             last_update = time.time()
             try:
                 synctime = int(Parameters['Mode3'])
             except ValueError:
                 synctime = 900
+            try:
+                localtime = int(Parameters.get('Mode4') or 0)
+            except ValueError:
+                localtime = 0
             if testData == True:
                 tuya = Domoticz.Log
                 with open(Parameters['HomeFolder'] + '/debug_devices.json', encoding='utf-8') as dFile:
@@ -1434,11 +1479,16 @@ def onHandleThread(startup):
         # Initialize/Update devices from TUYA API
         run = 0
         for dev in devs:
+            if local:
+                LocalValue = LocalResult(dev)
+                if LocalValue is None:
+                    continue
             run += 1
             try:
                 Domoticz.Debug( 'Device name=' + str(dev['name']) + ' id=' + str(dev['id']) + ' category=' + str(DeviceType(dev['category'],  dev['product_id'], properties.get(dev['id'], {}).get('functions'))))
-                last_update = time.time()
-                if testData == True:
+                if not local:
+                    last_update = time.time()
+                if testData == True or local:
                     online = True
                 else:
                     online = tuya.getconnectstatus(dev['id'])
@@ -1452,10 +1502,15 @@ def onHandleThread(startup):
                         rData = json.load(rFile)
                         ResultValue = rData['result']
                         t = rData['t']
+                elif local:
+                    ResultValue = LocalValue
+                    t = int(time.time() * 1000)
                 else:
                     Result = tuya.getstatus(dev['id'])
                     ResultValue = Result['result']
                     t = Result['t']
+                    last_result[dev['id']] = ResultValue
+                    ResultValue = LocalOverlay(dev['id'], ResultValue)
 
                 product_id = getConfigItem(dev['id'],'product_id')
 
@@ -3139,7 +3194,7 @@ def onHandleThread(startup):
                 raise Exception(f'Device {dev["name"]} not found in Domoticz! Has the device been removed, or is the "Accept New Hardware" option not enabled?')
 
             #update devices in Domoticz
-            if run == 1:
+            if run == 1 and not local:
                 Domoticz.Log('Update devices in Domoticz')
 
             if not bool(online) and Devices[dev['id']].TimedOut == 0:
@@ -5055,6 +5110,140 @@ def onHandleThread(startup):
 
     except Exception as err:
         Domoticz.Error('handleThread: ' + str(err)  + ' line ' + format(sys.exc_info()[-1].tb_lineno))
+
+def onLocalPoll():
+    # Between cloud polls: keep a LAN listener on every device that answers locally and apply what arrived
+    global local_thread, local_scan_logged, local_found
+    if localtime <= 0 or testData == True or globals().get('tuya') is None or 'devs' not in globals():
+        return
+    try:
+        if local_thread is None or (not local_thread.is_alive() and time.time() - local_scan_time > LOCAL_RESCAN):
+            local_thread = threading.Thread(target=LocalScan, name='TinyTuyaLocalScan', daemon=True)
+            local_thread.start()
+        if local_scan_logged != local_scan_time:
+            local_scan_logged = local_scan_time
+            if local_scan_error is not None:
+                Domoticz.Error('Local connection: LAN scan failed: ' + local_scan_error)
+            for dev in devs:
+                if dev['id'] in local_scan and dev.get('key') and dev['id'] not in local_listeners:
+                    dps_map[dev['id']] = LocalMapping(dev['id'])
+                    if dps_map[dev['id']]:
+                        local_listeners[dev['id']] = LocalListener(dev['id'], dev['key'])
+                        local_listeners[dev['id']].start()
+                    else:
+                        Domoticz.Error('Local connection: no DP map for ' + dev['name'])
+            found = [dev['name'] + ' ' + local_scan[dev['id']]['ip'] + ' (' + str(local_scan[dev['id']]['version']) + ')' for dev in devs if dev['id'] in local_listeners]
+            if found != local_found:
+                local_found = found
+                Domoticz.Log('Local connection: ' + (', '.join(found) if found else 'no device answers on the LAN'))
+        for dev in devs:
+            listener = local_listeners.get(dev['id'])
+            if listener is not None and listener.connected != local_state.get(dev['id'], False):
+                local_state[dev['id']] = listener.connected
+                Domoticz.Log('Local connection to ' + dev['name'] + (' established' if listener.connected else ' lost: ' + str(listener.error)))
+        if any(listener.seq != local_applied.get(dev_id) for dev_id, listener in local_listeners.items()):
+            onHandleThread(False, True)
+    except Exception as e:
+        Domoticz.Error("onLocalPoll ERROR: {}".format(str(e)))
+
+def LocalScan():
+    # Runs in a background thread: only rebinds the local_scan globals, never calls the Domoticz API
+    global local_scan, local_scan_time, local_scan_error
+    try:
+        found = tinytuya.deviceScan(verbose=False, maxretry=20, color=False, poll=False, byID=True)
+        local_scan = {dev_id: {'ip': info.get('ip'), 'version': info.get('version')} for dev_id, info in found.items() if info.get('ip')}
+        local_scan_error = None
+    except Exception as e:
+        local_scan_error = str(e)
+    local_scan_time = time.time()
+
+class LocalListener(threading.Thread):
+    # Keeps one LAN connection to a device and collects its DPs (status replies and pushes).
+    # Runs outside the plugin thread, so it touches neither the Domoticz API nor the cloud client.
+    def __init__(self, dev_id, key):
+        threading.Thread.__init__(self, name='TinyTuyaLocal-' + dev_id, daemon=True)
+        self.dev_id = dev_id
+        self.key = key
+        self.dps = {}
+        self.seq = 0
+        self.connected = False
+        self.error = None
+        self.stopping = threading.Event()
+
+    def run(self):
+        while not self.stopping.is_set():
+            endpoint = local_scan.get(self.dev_id)
+            if endpoint:
+                self.listen(endpoint)
+            self.stopping.wait(LOCAL_RETRY)
+
+    def listen(self, endpoint):
+        device = None
+        try:
+            device = tinytuya.Device(self.dev_id, endpoint['ip'], self.key, version=float(endpoint.get('version') or 3.3),
+                                     persist=True, connection_timeout=3, connection_retry_limit=1, connection_retry_delay=1)
+            device.set_socketTimeout(LOCAL_TIMEOUT)
+            reply = device.status()
+            next_status = time.time() + localtime
+            next_beat = time.time() + LOCAL_BEAT
+            while not self.stopping.is_set():
+                if isinstance(reply, dict) and 'Err' in reply:
+                    self.error = str(reply.get('Error'))
+                    return
+                if isinstance(reply, dict) and isinstance(reply.get('dps'), dict):
+                    self.dps.update({str(dp): value for dp, value in reply['dps'].items()})
+                    self.seq += 1
+                    self.connected, self.error = True, None
+                now = time.time()
+                if now >= next_status:
+                    next_status = now + localtime
+                    reply = device.status()
+                elif now >= next_beat:
+                    next_beat = now + LOCAL_BEAT
+                    reply = device.heartbeat(nowait=True)
+                else:
+                    reply = device.receive()
+        except Exception as e:
+            self.error = str(e)
+        finally:
+            self.connected = False
+            if device is not None:
+                device.close()
+
+def LocalMapping(dev_id):
+    # DP id -> code from the device model: unlike getdps it also lists non-standard DPs (qxj Wing_direction)
+    mapping = {}
+    try:
+        reply = tuya.cloudrequest('/v2.0/cloud/thing/%s/model' % dev_id)
+        model = json.loads(reply['result']['model'])
+        mapping = {str(p['abilityId']): p['code'] for service in model.get('services', []) for p in service.get('properties', [])}
+    except Exception as e:
+        Domoticz.Debug(f"Local connection: no device model for {dev_id}: {e}")
+    if not mapping:
+        schema = tuya.getdps(dev_id)
+        if isinstance(schema, dict) and schema.get('success'):
+            mapping = {str(item['dp_id']): item['code'] for part in ('status', 'functions') for item in schema['result'].get(part, [])}
+    return mapping
+
+def LocalResult(dev):
+    # What the LAN listener collected, in the cloud format; None when nothing arrived since the last call
+    listener = local_listeners.get(dev['id'])
+    if listener is None or not listener.connected or listener.seq == local_applied.get(dev['id']):
+        return None
+    local_applied[dev['id']] = listener.seq
+    return LocalOverlay(dev['id'], last_result.get(dev['id'], []))
+
+def LocalOverlay(dev_id, result):
+    # Lay the listener's DPs over a cloud status: LAN values are newer, some DPs only come as LAN pushes
+    # (qxj Wing_direction is missing from both the cloud status and a local status query) and others only
+    # from the cloud
+    listener = local_listeners.get(dev_id)
+    if listener is None or not listener.connected:
+        return result
+    mapping = dps_map.get(dev_id, {})
+    values = {mapping[dp]: value for dp, value in dict(listener.dps).items() if dp in mapping}
+    merged = [{'code': item['code'], 'value': values.pop(item['code'], item['value'])} for item in result]
+    return merged + [{'code': code, 'value': value} for code, value in values.items()]
 
 # Generic helper functions
 def DumpConfigToLog():
