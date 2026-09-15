@@ -24,7 +24,7 @@
         <li>A deviceID can be found in your Tuya IOT account. Go to Cloud => your project => Devices => Select one of your device IDs. (This ID is used to detect all the other devices.)</li>
         <li>Complete the initial setup of your devices using the app, and this plugin will automatically detect and use the same settings to find and add the devices into Domoticz.<br/></li>
         <li>Set the API polling interval in order not to exhaust your calls allocation before the end of the billing period.</li>
-        <li>Local connection: devices that announce themselves on the LAN (UDP broadcast) stay connected with their local key, so their updates arrive within seconds; the interval sets how often the full status is read again. Domoticz must be in the same network segment as the devices. Values a device does not send locally keep their last cloud value.</li>
+        <li>Local connection: devices that announce themselves on the LAN (UDP broadcast) stay connected with their local key, so their updates arrive within seconds; the interval sets how often the full status is read again. Domoticz must be in the same network segment as the devices. Values a device does not send locally keep their last cloud value. A device that sends locally every value its Domoticz units use is left out of the API polling while its connection lasts, which saves API calls.</li>
         </ul>
         If your subscription to the cloud development plan has expired, you can extend it &nbsp; <a href="https://iot.tuya.com/cloud/products/apply-extension">HERE</a><br/>
     </description>
@@ -109,6 +109,9 @@ local_state = {}
 localtime = 0
 dps_map = {}
 last_result = {}
+local_skipped = {}
+local_used = {}
+reading_dev = None
 
 class BasePlugin:
     enabled = False
@@ -1146,7 +1149,7 @@ class BasePlugin:
                 if Error is not None:
                     Domoticz.Error(Error['Payload'])
                 else:
-                    onHandleThread(False)
+                    onHandleThread(False, poll=True)
             else:
                 onHandleThread(False)
         except Exception as e:
@@ -1187,8 +1190,9 @@ def onHeartbeat():
     global _plugin
     _plugin.onHeartbeat()
 
-def onHandleThread(startup, local=False):
-    # Run for every device on startup and heartbeat; local=True reads only the devices that answer on the LAN
+def onHandleThread(startup, local=False, poll=False):
+    # Run for every device on startup and heartbeat; local=True reads only the devices that answer on the LAN,
+    # poll=True (the regular cloud poll) leaves out the devices whose LAN connection already delivers everything
     try:
         # Run full initialization on first startup or whenever the Tuya client
         # is not present (so we can retry initialization on subsequent
@@ -1477,13 +1481,18 @@ def onHandleThread(startup, local=False):
             #     scan = tinytuya.deviceScan(verbose=False, maxretry=None, byID=True)
 
         # Initialize/Update devices from TUYA API
+        global reading_dev
         run = 0
         for dev in devs:
             if local:
                 LocalValue = LocalResult(dev)
                 if LocalValue is None:
                     continue
+            elif poll and LocalCoversCloud(dev):
+                last_update = time.time()
+                continue
             run += 1
+            reading_dev = dev['id']
             try:
                 Domoticz.Debug( 'Device name=' + str(dev['name']) + ' id=' + str(dev['id']) + ' category=' + str(DeviceType(dev['category'],  dev['product_id'], properties.get(dev['id'], {}).get('functions'))))
                 if not local:
@@ -5179,6 +5188,9 @@ class LocalListener(threading.Thread):
 
     def listen(self, endpoint):
         device = None
+        # Every connection starts empty: what the device pushed while it was down is lost, so a value from an
+        # earlier connection may be outdated, and only values received on the live one count as current
+        self.dps = {}
         try:
             device = tinytuya.Device(self.dev_id, endpoint['ip'], self.key, version=float(endpoint.get('version') or 3.3),
                                      persist=True, connection_timeout=3, connection_retry_limit=1, connection_retry_delay=1)
@@ -5244,6 +5256,33 @@ def LocalOverlay(dev_id, result):
     values = {mapping[dp]: value for dp, value in dict(listener.dps).items() if dp in mapping}
     merged = [{'code': item['code'], 'value': values.pop(item['code'], item['value'])} for item in result]
     return merged + [{'code': code, 'value': value} for code, value in values.items()]
+
+def LocalCoversCloud(dev):
+    # True when the regular cloud poll would bring nothing the units use: the LAN connection is up and every
+    # value of the last cloud status that the device's units read (local_used, collected by StatusDeviceTuya)
+    # has also arrived over it, so the listener keeps them current and onLocalPoll applies them. Values no unit
+    # reads, like the empty extra sensor slots of a qxj station, do not keep a device in the poll; until the
+    # units have been updated once, every value counts. That saves getconnectstatus + getstatus per device and
+    # poll. A device with cloud-only values or a dropped connection is read from the cloud as before; the
+    # decision is logged when it changes.
+    listener = local_listeners.get(dev['id'])
+    missing = None
+    if listener is not None and listener.connected and dev['id'] in last_result:
+        mapping = dps_map.get(dev['id'], {})
+        seen = {mapping[dp] for dp in dict(listener.dps) if dp in mapping}
+        used = local_used.get(dev['id'])
+        missing = sorted(item['code'] for item in last_result[dev['id']]
+                         if item['code'] not in seen and (used is None or item['code'] in used))
+    previous = local_skipped.get(dev['id'])
+    if missing != previous:
+        local_skipped[dev['id']] = missing
+        if missing == []:
+            Domoticz.Log('Local connection: ' + dev['name'] + ' sends every value its units use locally, left out of the cloud poll')
+        elif missing:
+            Domoticz.Log('Local connection: ' + dev['name'] + ' still read from the cloud for ' + ', '.join(missing))
+        elif previous == []:
+            Domoticz.Log('Local connection: ' + dev['name'] + ' is back in the cloud poll')
+    return missing == []
 
 # Generic helper functions
 def DumpConfigToLog():
@@ -5390,7 +5429,10 @@ def UpdateDevice(ID, Unit, sValue, nValue, TimedOut, AlwaysUpdate = 0):
 
 def StatusDeviceTuya(Function):
     if searchCode(Function, ResultValue):
-        valueRaw = [item['value'] for item in ResultValue if re.search(r'\b'+Function+r'\b', item['code']) != None][0]
+        found = [item for item in ResultValue if re.search(r'\b'+Function+r'\b', item['code']) != None][0]
+        valueRaw = found['value']
+        # The codes a device's units read decide whether its LAN connection can stand in for the cloud poll
+        local_used.setdefault(reading_dev, set()).add(found['code'])
     else:
         Domoticz.Debug('StatusDeviceTuya called ' + Function + ' not found ')
         return None
