@@ -3979,6 +3979,20 @@ def onHandleThread(startup, local=False, poll=False):
                             currenttemp = StatusDeviceTuya(code_name)
                             if str(currenttemp) != str(Devices[dev['id']].Units[44].sValue):
                                 UpdateDevice(dev['id'], 44, currenttemp, 0, 0)
+                        if searchCode('Wing_direction', ResultValue) and searchCode('windspeed_avg', ResultValue):
+                            # qxj stations send the wind direction only as a LAN push, so the unit appears with the first one
+                            outdoor = searchCode('temp_current_external', ResultValue) and searchCode('windchill_index', ResultValue)
+                            if createDevice(dev['id'], 80):
+                                Domoticz.Log('Create Wind device')
+                                Domoticz.Unit(Name=dev['name'] + ' (Wind)', DeviceID=dev['id'], Unit=80, Type=86, Subtype=4 if outdoor else 1, Used=1).Create()
+                            bearing, direction = WindDirection(StatusDeviceTuya('Wing_direction'))
+                            if direction:
+                                # Domoticz wants 0.1 m/s, the station reports km/h
+                                speed = round(StatusDeviceTuya('windspeed_avg') / 0.36)
+                                gust = round(StatusDeviceTuya('windspeed_gust') / 0.36) if searchCode('windspeed_gust', ResultValue) else speed
+                                temp = StatusDeviceTuya('temp_current_external') if outdoor else 0
+                                chill = StatusDeviceTuya('windchill_index') if outdoor else 0
+                                UpdateDevice(dev['id'], 80, f'{bearing or 0};{direction};{speed};{gust};{temp};{chill}', 0, 0)
                         if searchCode('atmospheric_pressture', ResultValue):
                             # Barometer: hPa;forecast, 5 = unknown (qxj stations report no forecast)
                             UpdateDevice(dev['id'], 81, str(StatusDeviceTuya('atmospheric_pressture')) + ';5', 0, 0)
@@ -5283,6 +5297,15 @@ def LocalCoversCloud(dev):
         elif previous == []:
             Domoticz.Log('Local connection: ' + dev['name'] + ' is back in the cloud poll')
     return missing == []
+
+def WindDirection(raw):
+    # qxj Wing_direction: base64 of 9 bytes; 1-3 = name (NNW, C = calm), 5-6 = bearing, 0xFFFF = none
+    try:
+        data = base64.b64decode(raw)
+    except (ValueError, TypeError):
+        return None, ''
+    bearing = int.from_bytes(data[5:7], 'big')
+    return (None if bearing == 0xFFFF or len(data) < 7 else bearing), data[1:4].replace(b'\x00', b'').decode('ascii', 'ignore')
 
 # Generic helper functions
 def DumpConfigToLog():
