@@ -3981,7 +3981,10 @@ def onHandleThread(startup, local=False, poll=False):
                                 UpdateDevice(dev['id'], 44, currenttemp, 0, 0)
                         if searchCode('Wing_direction', ResultValue) and searchCode('windspeed_avg', ResultValue):
                             # qxj stations send the wind direction only as a LAN push, so the unit appears with the first one
-                            outdoor = searchCode('temp_current_external', ResultValue) and searchCode('windchill_index', ResultValue)
+                            # The chill field takes the feels-like temperature, which is what the station display shows; qxj stations keep
+                            # windchill_index at a stale value whenever the index does not apply (warm or calm weather)
+                            chill_code = 'feellike_temp' if searchCode('feellike_temp', ResultValue) else 'windchill_index'
+                            outdoor = searchCode('temp_current_external', ResultValue) and searchCode(chill_code, ResultValue)
                             if createDevice(dev['id'], 80):
                                 Domoticz.Log('Create Wind device')
                                 Domoticz.Unit(Name=dev['name'] + ' (Wind)', DeviceID=dev['id'], Unit=80, Type=86, Subtype=4 if outdoor else 1, Used=1).Create()
@@ -3991,7 +3994,7 @@ def onHandleThread(startup, local=False, poll=False):
                                 speed = round(StatusDeviceTuya('windspeed_avg') / 0.36)
                                 gust = round(StatusDeviceTuya('windspeed_gust') / 0.36) if searchCode('windspeed_gust', ResultValue) else speed
                                 temp = StatusDeviceTuya('temp_current_external') if outdoor else 0
-                                chill = StatusDeviceTuya('windchill_index') if outdoor else 0
+                                chill = StatusDeviceTuya(chill_code) if outdoor else 0
                                 UpdateDevice(dev['id'], 80, f'{bearing or 0};{direction};{speed};{gust};{temp};{chill}', 0, 0)
                         if searchCode('atmospheric_pressture', ResultValue):
                             # Barometer: hPa;forecast, 5 = unknown (qxj stations report no forecast)
